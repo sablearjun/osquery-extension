@@ -1,7 +1,3 @@
-// Vajra EDR client Isolation and Port blocking extension for Osquery
-// Author: Arjun Sable, IEOR, IIT Bombay
-// Date: 2023-07-25
-
 package main
 
 import (
@@ -12,23 +8,35 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/osquery/osquery-go"
 	"github.com/osquery/osquery-go/plugin/table"
 )
 
 var (
-	// Osqueryi
-	// socket = flag.String("socket", "\\\\.\\pipe\\shell.em", "Path to osquery socket file")
+	// Osqueryd
+	socket = flag.String("socket", "/var/osquery/osquery.em", "Path to osquery socket file")
 
 	// Osqueryd
-	socket = flag.String("socket", "\\\\.\\pipe\\osquery.em", "Path to osquery socket file")
+	// socket = flag.String("socket", "/root/.osquery/shell.em", "Path to osquery socket file")
 )
 
 func main() {
+
+	flag.Int("timeout", 0, "")
+	flag.Int("interval", 0, "")
+	flag.Bool("verbose", false, "")
+	// Check if the program is run with root privileges
+	if os.Geteuid() != 0 {
+		fmt.Println("This program must be run as root.")
+		return
+	}
+
 	flag.Parse()
 
 	// Osquery socket path
@@ -37,7 +45,7 @@ func main() {
 	}
 
 	// Create a new extension manager
-	manager, err := osquery.NewExtensionManagerServer("port_block", *socket)
+	manager, err := osquery.NewExtensionManagerServer("vajra_linux_extension", *socket)
 	if err != nil {
 		log.Fatalf("Failed to create extension manager: %v", err)
 	}
@@ -68,214 +76,377 @@ func PortBlockColumns() []table.ColumnDefinition {
 		table.TextColumn("port"),
 		table.TextColumn("action"),
 		table.TextColumn("reason"),
+		table.TextColumn("message"),
 	}
 }
 
-// PortBlockGenerate retrieves the port block rules from the extension's database table
+func blockPort(port string) {
+	if isUFWInstalled() {
+		blockWithUFW(port)
+	} else {
+		blockWithIPTables(port)
+	}
+}
+
+func allowPort(port string) {
+	if isUFWInstalled() {
+		allowWithUFW(port)
+	} else {
+		allowWithIPTables(port)
+	}
+}
+
+func blockWithUFW(port string) {
+	// Enable ufw if it's not already enabled
+	if !isUFWEnabled() {
+		if !enableUFW() {
+			fmt.Println("Failed to enable UFW. Exiting.")
+			return
+		}
+		fmt.Println("UFW has been enabled.")
+	}
+
+	// Run the ufw command to block the specified port
+	print(port)
+	blockCommand := exec.Command("sudo", "ufw", "deny", "in", port+"/tcp")
+	blockOutCommand := exec.Command("sudo", "ufw", "deny", "out", port+"/tcp")
+	blockOutput, err := blockCommand.CombinedOutput()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	blockOutOutput, err := blockOutCommand.CombinedOutput()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	fmt.Println("Out command:", blockOutOutput)
+
+	fmt.Println("Command Output:", string(blockOutput))
+}
+
+func allowWithUFW(port string) {
+	// Run the ufw command to allow the specified port
+	allowInCommand := exec.Command("ufw", "delete", "deny", "in", port+"/tcp")
+	allowOutCommand := exec.Command("ufw", "delete", "deny", "out", port+"/tcp")
+	allowOutput, err := allowInCommand.CombinedOutput()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	allowOutOutput, err := allowOutCommand.CombinedOutput()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	print(allowOutOutput)
+	fmt.Println("Command Output:", string(allowOutput))
+}
+
+func blockWithIPTables(port string) {
+	iptablesInCommand := exec.Command("sudo", "iptables", "-I", "INPUT", "1", "-p", "tcp", "--dport", port, "-j", "DROP", "-m", "comment", "--comment", "Vajra Rule")
+	iptablesOutCommand := exec.Command("sudo", "iptables", "-I", "OUTPUT", "1", "-p", "tcp", "--dport", port, "-j", "DROP", "-m", "comment", "--comment", "Vajra Rule")
+
+	iptablesOutput, err := iptablesInCommand.CombinedOutput()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	iptablesOutOutput, err := iptablesOutCommand.CombinedOutput()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	fmt.Println("Command Output:", string(iptablesOutput))
+	fmt.Println("Command Output:", string(iptablesOutOutput))
+
+}
+
+func isolateWithIPTables(port string) {
+
+	port_int, err := strconv.Atoi(port)
+	range1 := strconv.Itoa(port_int - 1)
+	range2 := strconv.Itoa(port_int + 1)
+	// blockPort("1:" + range1)
+	// blockPort(range2 + ":65535")
+	allowCmd := exec.Command("sudo", "iptables", "-I", "INPUT", "1", "-p", "tcp", "--dport", port, "-m", "comment", "--comment", "Vajra Isolate", "-j", "ACCEPT")
+	allowCmdOut := exec.Command("sudo", "iptables", "-I", "OUTPUT", "1", "-p", "tcp", "--dport", port, "-m", "comment", "--comment", "Vajra Isolate", "-j", "ACCEPT")
+	iptablesInCommand := exec.Command("sudo", "iptables", "-I", "INPUT", "2", "-p", "tcp", "--dport", "1:"+range1, "-j", "DROP", "-m", "comment", "--comment", "Vajra Isolate")
+	iptablesOutCommand := exec.Command("sudo", "iptables", "-I", "OUTPUT", "2", "-p", "tcp", "--dport", "1:"+range1, "-j", "DROP", "-m", "comment", "--comment", "Vajra Isolate")
+	iptablesInCommandrange2 := exec.Command("sudo", "iptables", "-I", "INPUT", "2", "-p", "tcp", "--dport", range2+":65535", "-j", "DROP", "-m", "comment", "--comment", "Vajra Isolate")
+	iptablesOutCommandrange2 := exec.Command("sudo", "iptables", "-I", "OUTPUT", "2", "-p", "tcp", "--dport", range2+":65535", "-j", "DROP", "-m", "comment", "--comment", "Vajra Isolate")
+
+	iptablesOutput, err := iptablesInCommand.CombinedOutput()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	iptablesOutOutput, err := iptablesOutCommand.CombinedOutput()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	iptablesOutputrange2, err := iptablesInCommandrange2.CombinedOutput()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	iptablesOutOutputrange2, err := iptablesOutCommandrange2.CombinedOutput()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	allowCmdOutput, err := allowCmd.CombinedOutput()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	allowCmdOutOutput, err := allowCmdOut.CombinedOutput()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	fmt.Println("Command Output:", string(iptablesOutput))
+	fmt.Println("Command Output:", string(iptablesOutOutput))
+	fmt.Println("Command Output:", string(iptablesOutputrange2))
+	fmt.Println("Command Output:", string(iptablesOutOutputrange2))
+	fmt.Println("Command Output:", string(allowCmdOutput))
+	fmt.Println("Command Output:", string(allowCmdOutOutput))
+
+}
+
+func allowWithIPTables(port string) {
+	iptablesCommand := exec.Command("iptables", "-D", "INPUT", "-p", "tcp", "--dport", port, "-j", "DROP", "-m", "comment", "--comment", "Vajra Rule")
+	iptablesOutCommand := exec.Command("sudo", "iptables", "-D", "OUTPUT", "-p", "tcp", "--dport", port, "-j", "DROP", "-m", "comment", "--comment", "Vajra Rule")
+	iptablesOutput, err := iptablesCommand.CombinedOutput()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	iptablesOutOutput, err := iptablesOutCommand.CombinedOutput()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	fmt.Println("Command Output:", string(iptablesOutput))
+	fmt.Println("Command Output:", string(iptablesOutOutput))
+}
+
+func isUFWInstalled() bool {
+	// _, err := exec.LookPath("ufw")
+	// return err == nil
+	return false
+}
+
+func isUFWEnabled() bool {
+	// statusCommand := exec.Command("ufw", "status")
+	// output, err := statusCommand.CombinedOutput()
+	// if err != nil {
+	// 	return false
+	// }
+	// return strings.Contains(string(output), "Status: active")
+	return false
+}
+
+func enableUFW() bool {
+	enableCommand := exec.Command("ufw", "enable")
+	err := enableCommand.Run()
+	return err == nil
+}
+
+func extractPortNumber(s string) string {
+	var port string
+	for _, r := range s {
+		if unicode.IsDigit(r) {
+			port += string(r)
+		}
+	}
+	return port
+}
+
+func checkUfwRules() ([]map[string]string, error) {
+	cmd := exec.Command("sudo", "ufw", "status", "verbose")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(string(output), "\n")
+	var rules []map[string]string
+
+	for _, line := range lines {
+		// Use TrimSpace to remove leading and trailing spaces
+		line = strings.TrimSpace(line)
+
+		// Skip empty lines and headers
+		if line == "" || strings.HasPrefix(line, "Status:") || strings.HasPrefix(line, "To") || strings.HasPrefix(line, "Action:") {
+			continue
+		}
+
+		// Split the line into parts
+		parts := strings.Fields(line)
+		if (len(parts) >= 3) && (strings.Contains(parts[1], "ALLOW") || strings.Contains(parts[1], "DENY")) {
+			// Assuming 'proto', 'from', and 'port' fields are present
+			rule := make(map[string]string)
+			rule["port"] = extractPortNumber(parts[0])
+			if parts[1] == "DENY" {
+				rule["action"] = "block"
+			} else {
+				rule["action"] = strings.ToLower(parts[1])
+			}
+			// rule["message"] = parts[2]
+			rules = append(rules, rule)
+		}
+	}
+
+	uniquePorts := make(map[string]bool)
+	var filteredRules []map[string]string
+
+	for _, rule := range rules {
+		port := rule["port"]
+		if !uniquePorts[port] {
+			uniquePorts[port] = true
+			filteredRules = append(filteredRules, rule)
+			print(filteredRules)
+		}
+	}
+	return filteredRules, nil
+
+}
+
+func checkIpTablesRules() ([]map[string]string, error) {
+	cmd := exec.Command("iptables", "-L", "-n", "-v")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(string(output), "\n")
+	fmt.Println(lines) // Print the lines for debugging purposes
+	var rules []map[string]string
+	var currentRule map[string]string
+
+	for _, line := range lines {
+		// Skip header lines and empty lines
+		if strings.HasPrefix(line, "Chain") || strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+
+		// New rule entry
+		if parts[0] == "Chain" {
+			if currentRule != nil {
+				rules = append(rules, currentRule)
+			}
+			currentRule = make(map[string]string) // Initialize currentRule as an empty map
+		} else {
+			// Assuming fields like 'pkts', 'bytes', and 'target' are present
+			currentRule = make(map[string]string)
+			currentRule[parts[len(parts)-1]] = strings.Join(parts[:len(parts)-1], " ")
+		}
+	}
+
+	if currentRule != nil {
+		rules = append(rules, currentRule)
+	}
+
+	return rules, nil
+}
+
 func PortBlockGenerate(ctx context.Context, queryContext table.QueryContext) ([]map[string]string, error) {
+
 	var results []map[string]string
 
 	actionConstraint, ok := queryContext.Constraints["action"]
 	if !ok || len(actionConstraint.Constraints) == 0 {
 		// No parameter is provided, return an error or take appropriate action
 		// Check saved rules
-		firewallRules, err := checkFirewallRules()
-		if err != nil {
-			return nil, err
+		if isUFWEnabled() {
+			firewallRules, err := checkUfwRules()
+			if err != nil {
+				return firewallRules, err
+			}
+			return firewallRules, err
+		} else {
+			firewallRules, err := checkIpTablesRules()
+			if err != nil {
+				return firewallRules, err
+			}
+			return firewallRules, err
 		}
-		return firewallRules, err
+
 	}
 	actionExpr, actionOK := queryContext.Constraints["action"]
-	portExpr, portOK := queryContext.Constraints["port"]
-
-	// Default blockRules containing the predefined rules
-	// blockRules := []map[string]string{}
+	portExpr := queryContext.Constraints["port"]
+	port := portExpr.Constraints[0].Expression
+	action := strings.ToLower(actionExpr.Constraints[0].Expression)
 
 	if actionOK && len(actionExpr.Constraints) > 0 {
-		// If "action" parameter is provided, get its value
-		action := strings.ToLower(actionExpr.Constraints[0].Expression)
-		//ToDo if action == 'allow' then delete the previous rule
+
 		if action == "block" {
 			// If "action" is "block" or "allow", add the specific port and action to blockRules
-			if portOK && len(portExpr.Constraints) > 0 {
-				for i := 0; i < len(portExpr.Constraints); i++ {
-					port := portExpr.Constraints[i].Expression
-					successMsg, err := blockPortTraffic(port, action)
-					if err != nil {
-						return nil, err
-					}
-					result := map[string]string{
-						"port":    port,
-						"action":  action,
-						"reason":  "Vajra Rule",
-						"message": successMsg,
-					}
-					results = append(results, result)
-				}
-				return results, nil
+			// blockcmd := exec.Command("sudo", "ufw", "deny", port)
+			// err := blockcmd.Run()
+			blockPort(port)
+			result := map[string]string{
+				"port":    port,
+				"action":  action,
+				"reason":  "Vajra Rule",
+				"message": "success",
 			}
+			results = append(results, result)
 		} else if action == "allow" {
-			for i := 0; i < len(portExpr.Constraints); i++ {
-				port := portExpr.Constraints[i].Expression
-				successMsg, err := allowPortTraffic(port, action)
-				if err != nil {
-					return nil, err
-				}
-				result := map[string]string{
-					"port":    port,
-					"action":  action,
-					"reason":  "Vajra Rule",
-					"message": successMsg,
-				}
-				results = append(results, result)
+			// allowcmd := exec.Command("sudo", "ufw", "delete", "deny", port)
+			// err := allowcmd.Run()
+			// if err != nil {
+			// 	return nil, err
+			// }
+			allowPort(port)
+			result := map[string]string{
+				"port":    port,
+				"action":  action,
+				"reason":  "Vajra Rule",
+				"message": "success",
 			}
-			return results, nil
+			results = append(results, result)
 		} else if action == "isolate" {
-			// If "action" is "isolate", add the predefined block rules to blockRules
-			port := portExpr.Constraints[0].Expression
-			isolateOk, err := isolateMachine(port)
-			if err != nil {
-				return nil, err
+			// allowPort(port)
+			// port_int, err := strconv.Atoi(port)
+			// range1 := strconv.Itoa(port_int - 1)
+			// range2 := strconv.Itoa(port_int + 1)
+			// print(err)
+			// blockPort("1:" + range1)
+			// blockPort(range2 + ":65535")
+			isolateWithIPTables(port)
+			result := map[string]string{
+				"port":    port,
+				"action":  action,
+				"reason":  "Vajra Rule",
+				"message": "success",
 			}
-			fmt.Println(isolateOk)
+			results = append(results, result)
 		} else if action == "reenroll" {
-			// If "action" is "reenroll", call the function to delete the Firewall rules
-			err := reenrollMachine()
-			if err != nil {
-				return nil, err
+			// allowPort(port)
+			port_int, err := strconv.Atoi(port)
+			range1 := strconv.Itoa(port_int - 1)
+			range2 := strconv.Itoa(port_int + 1)
+			print(err)
+			allowPort("1:" + range1)
+			allowPort(range2 + ":65535")
+			result := map[string]string{
+				"port":    port,
+				"action":  action,
+				"reason":  "Vajra Rule",
+				"message": "success",
 			}
+			results = append(results, result)
 		} else {
-			return nil, fmt.Errorf("invalid action parameter, must be 'block', 'allow', 'isolate', or 'reenroll'")
+			fmt.Print(action)
 		}
 	}
 	return results, nil
-}
-
-// blockPortTraffic blocks or allows traffic for the specified port using Windows Firewall API
-func blockPortTraffic(port, action string) (string, error) {
-	// Add firewall rule to block the traffic
-	cmd := exec.Command("powershell", "-Command", fmt.Sprintf("New-NetFirewallRule -DisplayName 'Vajra Rule' -Direction 'Outbound' -RemotePort '%s' -Protocol 'TCP' -Action %s", port, strings.Title(action)))
-	err := cmd.Run()
-	if err != nil {
-		return "fail", fmt.Errorf("failed to block port traffic: %v", err)
-	}
-	return "Port traffic blocked successfully!", nil
-}
-
-// allowPortTraffic blocks or allows traffic for the specified port using Windows Firewall API
-func allowPortTraffic(port, action string) (string, error) {
-	// Add firewall rule to allow the traffic
-	cmd := exec.Command("powershell", "-Command", fmt.Sprintf(`$rules = Get-NetFirewallRule | Where-Object { $_.DisplayName -eq 'Vajra Rule' -and $_.Action -eq 'Block' }
-	
-	foreach ($rule in $rules) {
-		$action = $rule | Select-Object -ExpandProperty Action
-		$name = $rule | Select-Object -ExpandProperty Name
-		$ports = $rule | Get-NetFirewallPortFilter
-		$displayName = $rule | Select-Object -ExpandProperty DisplayName
-		foreach ($port in $ports) {
-				$remotePort =  $port | Select-Object -ExpandProperty RemotePort
-				Write-Output "$remotePort"
-			if ($remotePort -eq '%s' -and $action -eq 'Block') {
-				Write-Output "$name"
-				Remove-NetFirewallRule -Name $name
-			}
-			Write-Output "$action,$remotePort,$displayName"
-		}
-	}`, port))
-	err := cmd.Run()
-	if err != nil {
-		return "fail", fmt.Errorf("failed to allow port traffic: %v", err)
-	}
-	return "Port traffic allowed successfully!", nil
-}
-
-// deleteFirewallRules deletes the Firewall rules with the display name 'Vajra Rule'
-func deleteFirewallRules() error {
-	// Delete the rule from firewall
-	cmd := exec.Command("powershell", "-Command", "Get-NetFirewallRule | ? DisplayName -eq 'Vajra Rule' | Remove-NetFirewallRule")
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("failed to delete Firewall rules: %v", err)
-	}
-	return nil
-}
-
-func isolateMachine(port string) (string, error) {
-	// Isolate machine by adding rule to allow only one port and block all other ports
-	isolateRules := []map[string]string{
-		{
-			"port":   port,
-			"action": "allow",
-		},
-		{
-			"port":   "1-1233",
-			"action": "block",
-		},
-		{
-			"port":   "1235-65535",
-			"action": "block",
-		},
-	}
-	// Apply the isolate rules using Windows Firewall API
-	for _, rule := range isolateRules {
-		cmd := exec.Command("powershell", "-Command", fmt.Sprintf("New-NetFirewallRule -DisplayName 'Vajra Isolate' -Direction 'Outbound' -RemotePort '%s' -Protocol 'TCP' -Action %s", rule["port"], strings.Title(rule["action"])))
-		err := cmd.Run()
-		if err != nil {
-			return "fail", fmt.Errorf("failed to isolate: %v", err)
-		}
-	}
-	return "Machine isolated successfully!", nil
-}
-
-// deleteFirewallRules deletes the Firewall rules with the display name 'Vajra Rule'
-func reenrollMachine() error {
-	// Implement your logic to delete the Firewall rules with the display name 'Vajra Rule'
-	// You can use appropriate Windows Firewall libraries or APIs to achieve this
-
-	// Example implementation using PowerShell command:
-	cmd := exec.Command("powershell", "-Command", "Get-NetFirewallRule | ? DisplayName -eq 'Vajra Isolate' | Remove-NetFirewallRule")
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("failed to reenroll: %v", err)
-	}
-
-	return nil
-}
-
-// Check active rules
-func checkFirewallRules() ([]map[string]string, error) {
-	cmd := exec.Command("powershell", "-Command", `
-	$rules = Get-NetFirewallRule | Where-Object { $_.DisplayName -eq 'Vajra Rule' -or $_.DisplayName -eq 'Vajra Isolate' }
-	
-	foreach ($rule in $rules) {
-		$action = $rule | Select-Object -ExpandProperty Action
-		$ports = $rule | Get-NetFirewallPortFilter
-		$displayName = $rule | Select-Object -ExpandProperty DisplayName
-		foreach ($port in $ports) {
-			$remotePort = $port | Select-Object -ExpandProperty RemotePort
-			Write-Output "$action,$remotePort,$displayName"
-		}
-	}
-	`)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("failed to run PowerShell script: %v", err)
-	}
-
-	// Parse the output and create a table
-	var result []map[string]string
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
-		fields := strings.Split(line, ",")
-		if len(fields) == 3 {
-			entry := map[string]string{
-				"action": fields[0],
-				"port":   strings.ReplaceAll(fields[1], "\r", ""),
-				"reason": strings.ReplaceAll(fields[2], "\r", ""),
-			}
-			result = append(result, entry)
-		}
-	}
-
-	return result, nil
 }
